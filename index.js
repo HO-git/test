@@ -8,6 +8,9 @@ const QDRANT_MEMORY_FLAG = "__qdrantMemory"
 // Default settings
 const defaultSettings = {
   enabled: true,
+  provider: "openai",
+  apiKey: "",
+  baseUrl: "https://api.openai.com/v1/embeddings",
   qdrantUrl: "http://localhost:6333",
   collectionName: "mem",
   openaiApiKey: "",
@@ -1457,11 +1460,27 @@ function createSettingsUI() {
             
             <div style="margin: 10px 0;">
                 <label><strong>OpenAI API Key:</strong></label>
-                <input type="password" id="qdrant_openai_key" class="text_pole" value="${settings.openaiApiKey}" 
+                <input type="password" id="qdrant_openai_key" class="text_pole" value="${settings.openaiApiKey}"
                        placeholder="sk-..." style="width: 100%; margin-top: 5px;" />
                 <small style="color: #666;">Required for generating embeddings</small>
             </div>
-            
+
+            <div class="qdrant-provider-settings" style="margin: 10px 0;">
+                <label for="qdrant_provider"><strong>Embedding Provider:</strong></label>
+                <select id="qdrant_provider" style="width: 100%; margin-top: 5px;">
+                    <option value="openai" ${settings.provider === "openai" ? "selected" : ""}>OpenAI</option>
+                    <option value="openrouter" ${settings.provider === "openrouter" ? "selected" : ""}>OpenRouter</option>
+                    <option value="huggingface" ${settings.provider === "huggingface" ? "selected" : ""}>Hugging Face</option>
+                    <option value="custom" ${settings.provider === "custom" ? "selected" : ""}>Custom</option>
+                </select>
+                <br>
+                <label for="qdrant_api_key" style="margin-top: 10px; display: block;"><strong>Provider API Key:</strong></label>
+                <input type="text" id="qdrant_api_key" placeholder="sk-..." style="width:100%" value="${settings.apiKey || ""}">
+                <br>
+                <label for="qdrant_base_url" style="margin-top: 10px; display: block;"><strong>Custom Base URL (optional):</strong></label>
+                <input type="text" id="qdrant_base_url" placeholder="https://api.example.com/v1/embeddings" style="width:100%" value="${settings.baseUrl || ""}">
+            </div>
+
             <div style="margin: 10px 0;">
                 <label><strong>Embedding Model:</strong></label>
                 <select id="qdrant_embedding_model" class="text_pole" style="width: 100%; margin-top: 5px;">
@@ -1600,6 +1619,18 @@ function createSettingsUI() {
 
   $("#qdrant_openai_key").on("input", function () {
     settings.openaiApiKey = $(this).val()
+  })
+
+  $("#qdrant_provider").on("change", function () {
+    settings.provider = $(this).val()
+  })
+
+  $("#qdrant_api_key").on("input", function () {
+    settings.apiKey = $(this).val()
+  })
+
+  $("#qdrant_base_url").on("input", function () {
+    settings.baseUrl = $(this).val()
   })
 
   $("#qdrant_embedding_model").on("change", function () {

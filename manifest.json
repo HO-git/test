@@ -1,0 +1,11 @@
+{
+  "display_name": "Qdrant Memory",
+  "loading_order": 100,
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Community",
+  "version": "3.0.0",
+  "description": "Automatic memory creation with per-character collections. Retrieves relevant memories from Qdrant and injects them into conversations before generation.",
+  "generate_interceptor": "qdrantMemoryInterceptor",
+  "minimum_client_version": "1.11.0"
+}

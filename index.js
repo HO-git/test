@@ -8,6 +8,9 @@ const QDRANT_MEMORY_FLAG = "__qdrantMemory"
 // Default settings
 const defaultSettings = {
   enabled: true,
+  provider: "openai",
+  apiKey: "",
+  baseUrl: "https://api.openai.com/v1/embeddings",
   qdrantUrl: "http://localhost:6333",
   collectionName: "mem",
   openaiApiKey: "",
@@ -36,6 +39,34 @@ let processingSaveQueue = false
 let messageBuffer = []
 let lastMessageTime = 0
 let chunkTimer = null
+
+const providerModelCache = new Map()
+
+function getEffectiveEmbeddingApiKey(currentSettings = settings) {
+  if (!currentSettings || typeof currentSettings !== "object") {
+    return ""
+  }
+  return currentSettings.apiKey || currentSettings.openaiApiKey || ""
+}
+
+function getProviderLabel(provider) {
+  const normalized = (provider || "").toLowerCase()
+  switch (normalized) {
+    case "openrouter":
+      return "OpenRouter"
+    case "huggingface":
+      return "Hugging Face"
+    case "custom":
+      return "Custom"
+    default:
+      return "OpenAI"
+  }
+}
+
+function providerRequiresApiKey(provider) {
+  const normalized = (provider || "").toLowerCase()
+  return normalized === "openai" || normalized === "openrouter" || normalized === "huggingface"
+}
 
 function isQdrantMemoryMessage(message) {
   return Boolean(message && message[QDRANT_MEMORY_FLAG])
@@ -94,6 +125,9 @@ function loadSettings() {
   if (saved) {
     try {
       settings = { ...defaultSettings, ...JSON.parse(saved) }
+      if (settings.openaiApiKey && !settings.apiKey) {
+        settings.apiKey = settings.openaiApiKey
+      }
     } catch (e) {
       console.error("[Qdrant Memory] Failed to load settings:", e)
     }
@@ -130,7 +164,207 @@ function getEmbeddingDimensions() {
     "text-embedding-3-small": 1536,
     "text-embedding-ada-002": 1536,
   }
-  return dimensions[settings.embeddingModel] || 1536
+  const modelId = settings.embeddingModel || ""
+  if (dimensions[modelId]) {
+    return dimensions[modelId]
+  }
+
+  if (modelId.endsWith("text-embedding-3-large")) {
+    return 3072
+  }
+
+  if (modelId.endsWith("text-embedding-3-small") || modelId.endsWith("text-embedding-ada-002")) {
+    return 1536
+  }
+
+  return 1536
+}
+
+const EMBEDDING_MODEL_DEFAULTS = {
+  openai: [
+    { value: "text-embedding-3-large", label: "text-embedding-3-large (best quality)" },
+    { value: "text-embedding-3-small", label: "text-embedding-3-small (faster)" },
+    { value: "text-embedding-ada-002", label: "text-embedding-ada-002 (legacy)" },
+  ],
+  openrouter: [
+    { value: "openai/text-embedding-3-large", label: "OpenAI text-embedding-3-large" },
+    { value: "openai/text-embedding-3-small", label: "OpenAI text-embedding-3-small" },
+    { value: "cohere/embed-english-v3.0", label: "Cohere embed-english-v3.0" },
+    { value: "cohere/embed-multilingual-v3.0", label: "Cohere embed-multilingual-v3.0" },
+  ],
+}
+
+function getDefaultModelsForProvider(provider) {
+  return EMBEDDING_MODEL_DEFAULTS[provider] ? [...EMBEDDING_MODEL_DEFAULTS[provider]] : []
+}
+
+async function fetchOpenRouterEmbeddingModels(apiKey) {
+  const headers = { "Content-Type": "application/json" }
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`
+  }
+
+  const response = await fetch("https://openrouter.ai/api/v1/models", { headers })
+  if (!response.ok) {
+    throw new Error(`OpenRouter responded with ${response.status}`)
+  }
+
+  const payload = await response.json()
+  const models = Array.isArray(payload?.data) ? payload.data : []
+
+  return models
+    .filter((model) => {
+      const id = String(model?.id || "").toLowerCase()
+      const modality = String(model?.architecture?.modality || "").toLowerCase()
+      return modality === "embedding" || id.includes("embedding")
+    })
+    .map((model) => {
+      const id = model?.id || ""
+      const name = model?.name || id
+      return {
+        value: id,
+        label: name === id ? id : `${name} (${id})`,
+      }
+    })
+}
+
+function setModelOptions($select, options, selectedModel) {
+  const unique = new Map()
+  options.forEach((opt) => {
+    if (!opt || !opt.value) return
+    if (!unique.has(opt.value)) {
+      unique.set(opt.value, opt.label || opt.value)
+    }
+  })
+
+  $select.empty()
+
+  for (const [value, label] of unique) {
+    $select.append(new Option(label, value))
+  }
+
+  let finalValue = selectedModel && unique.has(selectedModel) ? selectedModel : null
+
+  if (!finalValue && selectedModel) {
+    $select.append(new Option(`${selectedModel} (saved)`, selectedModel))
+    finalValue = selectedModel
+  }
+
+  if (!finalValue && unique.size > 0) {
+    finalValue = unique.keys().next().value
+  }
+
+  if (finalValue) {
+    $select.val(finalValue)
+    settings.embeddingModel = finalValue
+  }
+}
+
+async function updateModelControls(provider, { forceRefresh = false } = {}) {
+  const $ = window.$
+  if (typeof $ !== "function") {
+    return
+  }
+  const $selectWrapper = $("#qdrant_model_select_wrapper")
+  const $select = $("#qdrant_embedding_model")
+  const $customWrapper = $("#qdrant_custom_model_wrapper")
+  const $customInput = $("#qdrant_custom_model")
+  const $status = $("#qdrant_model_status")
+  const savedModel = settings.embeddingModel
+
+  if (!$("#qdrant_provider").length) {
+    return
+  }
+
+  const normalizedProvider = (provider || "").toLowerCase()
+
+  if (normalizedProvider === "openai" || normalizedProvider === "openrouter") {
+    $customWrapper.hide()
+    $selectWrapper.show()
+    $select.prop("disabled", true)
+    $status.text("Loading models...")
+
+    try {
+      let models = []
+      const cacheKey = normalizedProvider
+      if (!forceRefresh && providerModelCache.has(cacheKey)) {
+        models = providerModelCache.get(cacheKey)
+      } else {
+        if (normalizedProvider === "openai") {
+          models = getDefaultModelsForProvider("openai")
+        } else {
+          const apiKey = getEffectiveEmbeddingApiKey()
+          try {
+            models = await fetchOpenRouterEmbeddingModels(apiKey)
+          } catch (err) {
+            if (settings.debugMode) {
+              console.warn("[Qdrant Memory] Falling back to default OpenRouter models:", err)
+            }
+            models = []
+          }
+
+          if (!Array.isArray(models) || models.length === 0) {
+            models = getDefaultModelsForProvider("openrouter")
+          }
+        }
+
+        providerModelCache.set(cacheKey, models)
+      }
+
+      if (!Array.isArray(models) || models.length === 0) {
+        $status.text("No models available automatically. Enter a custom model below.")
+        $selectWrapper.hide()
+        $customWrapper.show()
+        $customInput.val(savedModel || "")
+        settings.embeddingModel = $customInput.val()
+        return
+      }
+
+      let desiredModel = savedModel
+      if (normalizedProvider === "openrouter" && savedModel && !savedModel.includes("/")) {
+        const namespaced = `openai/${savedModel}`
+        if (models.some((model) => model.value === namespaced)) {
+          desiredModel = namespaced
+        }
+      }
+
+      if (normalizedProvider === "openai" && savedModel && savedModel.includes("/")) {
+        const trimmed = savedModel.split("/").pop()
+        if (trimmed && models.some((model) => model.value === trimmed)) {
+          desiredModel = trimmed
+        }
+      }
+
+      setModelOptions($select, models, desiredModel)
+      if (normalizedProvider === "openrouter") {
+        $status.text("Models provided by OpenRouter. Use Refresh after updating access.")
+      } else {
+        $status.text("Default OpenAI embedding models.")
+      }
+    } catch (error) {
+      console.error(`[Qdrant Memory] Failed to load ${provider} models:`, error)
+      $status.text("Failed to load models automatically. Enter a custom model below.")
+      $selectWrapper.hide()
+      $customWrapper.show()
+      $customInput.val(savedModel || "")
+      settings.embeddingModel = $customInput.val()
+    } finally {
+      $select.prop("disabled", false)
+    }
+
+    return
+  }
+
+  $selectWrapper.hide()
+  $customWrapper.show()
+  $customInput.val(savedModel || "")
+  settings.embeddingModel = $customInput.val()
+
+  if (normalizedProvider === "huggingface") {
+    $status.text("Enter the Hugging Face repository ID for your embedding model.")
+  } else {
+    $status.text("Specify the embedding model identifier required by your provider.")
+  }
 }
 
 // Check if collection exists
@@ -194,11 +428,11 @@ async function ensureCollection(characterName) {
 
 // Universal Embedding Generator (OpenAI / OpenRouter / HuggingFace / Custom)
 async function generateEmbedding(text) {
-  const settings = extension_settings.qdrantMemory || {};
-  const provider = settings.provider || "openai";
-  const apiKey = settings.apiKey || settings.openaiApiKey; // fallback
-  const model = settings.embeddingModel || "text-embedding-3-large";
-  const customUrl = settings.baseUrl || "https://api.openai.com/v1/embeddings";
+  const cfg = extension_settings.qdrantMemory || {}
+  const provider = cfg.provider || "openai"
+  const apiKey = cfg.apiKey || cfg.openaiApiKey || ""
+  const model = cfg.embeddingModel || "text-embedding-3-large"
+  const customUrl = cfg.baseUrl || "https://api.openai.com/v1/embeddings"
 
   try {
     let apiUrl = customUrl;
@@ -210,14 +444,16 @@ async function generateEmbedding(text) {
         apiUrl = "https://openrouter.ai/api/v1/embeddings";
         headers = {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
         };
         payload = { input: text, model };
         break;
 
       case "huggingface":
         apiUrl = `https://api-inference.huggingface.co/pipeline/feature-extraction/${model}`;
-        headers = { "Authorization": `Bearer ${apiKey}` };
+        headers = apiKey
+          ? { Authorization: `Bearer ${apiKey}` }
+          : { "Content-Type": "application/json" };
         payload = { inputs: text };
         break;
 
@@ -231,10 +467,10 @@ async function generateEmbedding(text) {
         break;
 
       default: // OpenAI
-        apiUrl = "https://api.openai.com/v1/embeddings";
+        apiUrl = customUrl || "https://api.openai.com/v1/embeddings";
         headers = {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
         };
         payload = { input: text, model };
     }
@@ -569,7 +805,7 @@ async function processMessageBuffer() {
 
 function bufferMessage(text, characterName, isUser, messageId) {
   if (!settings.autoSaveMemories) return
-  if (!settings.openaiApiKey) return
+  if (providerRequiresApiKey(settings.provider) && !getEffectiveEmbeddingApiKey()) return
   if (text.length < settings.minMessageLength) return
 
   // Check if we should save this type of message
@@ -1030,8 +1266,9 @@ async function indexCharacterChats() {
     return
   }
 
-  if (!settings.openaiApiKey) {
-    toastr.error("OpenAI API key not set", "Qdrant Memory")
+  if (providerRequiresApiKey(settings.provider) && !getEffectiveEmbeddingApiKey()) {
+    const providerLabel = getProviderLabel(settings.provider)
+    toastr.error(`${providerLabel} API key not set`, "Qdrant Memory")
     return
   }
 
@@ -1455,20 +1692,35 @@ function createSettingsUI() {
                 <small style="color: #666;">Base name for collections (character name will be appended)</small>
             </div>
             
-            <div style="margin: 10px 0;">
-                <label><strong>OpenAI API Key:</strong></label>
-                <input type="password" id="qdrant_openai_key" class="text_pole" value="${settings.openaiApiKey}" 
-                       placeholder="sk-..." style="width: 100%; margin-top: 5px;" />
-                <small style="color: #666;">Required for generating embeddings</small>
+            <div class="qdrant-provider-settings" style="margin: 10px 0;">
+                <label for="qdrant_provider"><strong>Embedding Provider:</strong></label>
+                <select id="qdrant_provider" style="width: 100%; margin-top: 5px;">
+                    <option value="openai" ${settings.provider === "openai" ? "selected" : ""}>OpenAI</option>
+                    <option value="openrouter" ${settings.provider === "openrouter" ? "selected" : ""}>OpenRouter</option>
+                    <option value="huggingface" ${settings.provider === "huggingface" ? "selected" : ""}>Hugging Face</option>
+                    <option value="custom" ${settings.provider === "custom" ? "selected" : ""}>Custom</option>
+                </select>
+                <br>
+                <label for="qdrant_api_key" style="margin-top: 10px; display: block;"><strong>Provider API Key:</strong></label>
+                <input type="text" id="qdrant_api_key" placeholder="sk-..." style="width:100%" value="${settings.apiKey || settings.openaiApiKey || ""}">
+                <br>
+                <label for="qdrant_base_url" style="margin-top: 10px; display: block;"><strong>Custom Base URL (optional):</strong></label>
+                <input type="text" id="qdrant_base_url" placeholder="https://api.example.com/v1/embeddings" style="width:100%" value="${settings.baseUrl || ""}">
             </div>
-            
+
             <div style="margin: 10px 0;">
                 <label><strong>Embedding Model:</strong></label>
-                <select id="qdrant_embedding_model" class="text_pole" style="width: 100%; margin-top: 5px;">
-                    <option value="text-embedding-3-large" ${settings.embeddingModel === "text-embedding-3-large" ? "selected" : ""}>text-embedding-3-large (best quality)</option>
-                    <option value="text-embedding-3-small" ${settings.embeddingModel === "text-embedding-3-small" ? "selected" : ""}>text-embedding-3-small (faster)</option>
-                    <option value="text-embedding-ada-002" ${settings.embeddingModel === "text-embedding-ada-002" ? "selected" : ""}>text-embedding-ada-002 (legacy)</option>
-                </select>
+                <div id="qdrant_model_select_wrapper" style="display: flex; gap: 8px; align-items: center; margin-top: 5px;">
+                    <select id="qdrant_embedding_model" class="text_pole" style="flex: 1 1 auto;">
+                        <option value="" disabled selected>Loading models...</option>
+                    </select>
+                    <button type="button" id="qdrant_refresh_models" class="menu_button" style="flex: 0 0 auto; padding: 6px 12px;">Refresh</button>
+                </div>
+                <div id="qdrant_custom_model_wrapper" style="margin-top: 5px; display: none;">
+                    <input type="text" id="qdrant_custom_model" class="text_pole" style="width: 100%;" placeholder="Enter model identifier" value="${settings.embeddingModel || ""}">
+                </div>
+                <small style="color: #666;">Choose a supported embedding model or provide a custom identifier.</small>
+                <div id="qdrant_model_status" style="color: #666; font-size: 0.85em; margin-top: 5px;"></div>
             </div>
             
             <hr style="margin: 15px 0;" />
@@ -1598,12 +1850,33 @@ function createSettingsUI() {
     settings.collectionName = $(this).val()
   })
 
-  $("#qdrant_openai_key").on("input", function () {
-    settings.openaiApiKey = $(this).val()
+  $("#qdrant_provider").on("change", function () {
+    settings.provider = $(this).val()
+    updateModelControls(settings.provider, { forceRefresh: true })
+  })
+
+  $("#qdrant_api_key").on("input", function () {
+    const value = $(this).val()
+    settings.apiKey = value
+    settings.openaiApiKey = value
+  })
+
+  $("#qdrant_base_url").on("input", function () {
+    settings.baseUrl = $(this).val()
   })
 
   $("#qdrant_embedding_model").on("change", function () {
     settings.embeddingModel = $(this).val()
+  })
+
+  $("#qdrant_custom_model").on("input", function () {
+    settings.embeddingModel = $(this).val()
+  })
+
+  $("#qdrant_refresh_models").on("click", function () {
+    providerModelCache.delete("openrouter")
+    providerModelCache.delete("openai")
+    updateModelControls(settings.provider, { forceRefresh: true })
   })
 
   $("#qdrant_memory_limit").on("input", function () {
@@ -1695,6 +1968,10 @@ function createSettingsUI() {
 
   $("#qdrant_index_chats").on("click", () => {
     indexCharacterChats()
+  })
+
+  updateModelControls(settings.provider, { forceRefresh: true }).catch((error) => {
+    console.error("[Qdrant Memory] Failed to initialize embedding models:", error)
   })
 }
 

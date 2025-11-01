@@ -1,0 +1,45 @@
+/* Qdrant Memory Extension Styles */
+
+.qdrant-memory-settings {
+    padding: 0;
+    margin: 0 0 10px;
+}
+
+.qdrant-memory-settings h3 {
+    margin-top: 0;
+    color: var(--SmartThemeBodyColor, #333);
+}
+
+.qdrant-memory-settings label {
+    color: var(--SmartThemeBodyColor, #333);
+    font-size: 0.95em;
+}
+
+.qdrant-memory-settings small {
+    display: block;
+    margin-top: 3px;
+    font-size: 0.85em;
+}
+
+.qdrant-memory-settings input[type="text"],
+.qdrant-memory-settings input[type="password"],
+.qdrant-memory-settings select {
+    font-family: monospace;
+}
+
+.qdrant-memory-settings input[type="range"] {
+    cursor: pointer;
+}
+
+.qdrant-memory-settings .menu_button {
+    flex: 1;
+}
+
+#qdrant_status {
+    font-size: 0.9em;
+    transition: all 0.3s ease;
+}
+
+#qdrant_status:empty {
+    display: none;
+}
